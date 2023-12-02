@@ -1,131 +1,116 @@
-import numpy as np
 import cv2
+import numpy as np
+from skimage.metrics import mean_squared_error, peak_signal_noise_ratio, structural_similarity
 
 
 def motion_estimation_exhaustive_search(imgP, imgI, mbSize, p):
-    row, col = imgI.shape
-    vectors = np.zeros((2, row * col // mbSize ** 2))
-    costs = np.ones((2 * p + 1, 2 * p + 1)) * 65537
-    computations = 0
+    height, width = imgP.shape[:2]
+    motion_vectors = np.zeros((height // mbSize, width // mbSize, 2))
 
-    # start from the top left of the image then go block by block each of size = mbSize
-    mbCount = 1
-    for i in range(0, row - mbSize + 1, mbSize):
-        for j in range(0, col - mbSize + 1, mbSize):
+    for y in range(0, height, mbSize):
+        for x in range(0, width, mbSize):
+            # Search for motion vectors in the neighborhood
+            min_mad = float('inf')
+            best_mv = (0, 0)
 
-            # the search starts here
-            # evaluate the cost for (2p + 1) blocks vertically and horizontally, remember p is our search parameter
-            for row_i in range(-p, p + 1):
-                for col_i in range(-p, p + 1):
-                    # row coordinate for current ref block
-                    refBlkVer = i + row_i
-                    # col coordinate for current ref block
-                    refBlkHor = j + col_i
+            for mv_y in range(-p, p + 1):
+                for mv_x in range(-p, p + 1):
+                    # Calculate the mean absolute difference (MAD)
+                    block = imgI[y:y + mbSize, x:x + mbSize]
 
-                    if refBlkVer < 0 or refBlkVer + mbSize > row or refBlkHor < 0 or refBlkHor + mbSize > col:
-                        continue
+                    # Ensure the motion vectors are within the target frame boundaries
+                    if 0 <= y + mv_y < height - mbSize and 0 <= x + mv_x < width - mbSize:
+                        target_block = imgP[y + mv_y:y + mv_y + mbSize, x + mv_x:x + mv_x + mbSize]
 
-                    costs[row_i + p, col_i + p] = cost_func_mad(imgP[i:i + mbSize, j:j + mbSize],
-                                                        imgI[refBlkVer:refBlkVer + mbSize,
-                                                        refBlkHor:refBlkHor + mbSize],
-                                                        mbSize)
-                    computations += 1
+                        mad = np.sum(np.abs(block - target_block))
 
-            # use the min_cost function to find the minimum vector and store it
-            dx, dy, min = min_cost(costs)
-            # row co-coordinate for the vector
-            vectors[0, mbCount - 1] = dy - p - 1
-            # col co-coordinate for the vector
-            vectors[1, mbCount - 1] = dx - p - 1
-            mbCount += 1
-            costs = np.ones((2 * p + 1, 2 * p + 1)) * 65537
+                        # Update the best motion vector if needed
+                        if mad < min_mad:
+                            min_mad = mad
+                            best_mv = (mv_x, mv_y)
 
-    motionVect = vectors
-    EScomputations = computations / (mbCount - 1)
+            # Store the best motion vector for the current macroblock
+            motion_vectors[y // mbSize, x // mbSize] = best_mv
 
-    return motionVect, EScomputations
+    return motion_vectors
 
 
-# find the mean absolute difference between two images (blocks)
-def cost_func_mad(block1, block2, mbSize):
-    return np.sum(np.abs(block1 - block2)) / (mbSize ** 2)
+def reconstruct_frame(imgP, motion_vectors, mbSize):
+    height, width = imgP.shape[:2]
+    reconstructed_frame = np.zeros_like(imgP, dtype=np.uint8)
+
+    for y in range(0, height, mbSize):
+        for x in range(0, width, mbSize):
+            mv_x, mv_y = motion_vectors[y // mbSize, x // mbSize]
+
+            # Ensure the motion vectors are integers
+            mv_x, mv_y = int(mv_x), int(mv_y)
+
+            # Apply motion vector to reconstruct the block
+            block = imgP[y + mv_y:y + mv_y + mbSize, x + mv_x:x + mv_x + mbSize]
+
+            # Place the reconstructed block in the frame
+            reconstructed_frame[y:y + mbSize, x:x + mbSize] = block
+
+    return reconstructed_frame
 
 
-# in a group of costs, find the smallest one and return its coordinates and value
-def min_cost(costs):
-    min_index = np.argmin(costs)
-    min_row, min_col = divmod(min_index, costs.shape[1])
-    return min_col, min_row, costs[min_row, min_col]
+def compute_metrics(frame_original, frame_reconstructed):
+    mse = mean_squared_error(frame_original, frame_reconstructed)
+    psnr = peak_signal_noise_ratio(frame_original, frame_reconstructed)
+    ssim, _ = structural_similarity(frame_original, frame_reconstructed, full=True)
+
+    return mse, psnr, ssim
 
 
-def calculate_motion_vectors(video_path, mbSize, p, num_frames=10):
-    cap = cv2.VideoCapture(video_path)
+# Load the video
+video_path = "Foreman360p.mp4"
+cap = cv2.VideoCapture(video_path)
 
-    # Check if the video file is opened successfully
-    if not cap.isOpened():
-        print("Error: Could not open video.")
-        return
+# Number of frames to examine
+num_frames_to_examine = 5
 
-    # Get video properties
-    frame_width = int(cap.get(3))
-    frame_height = int(cap.get(4))
-    frame_rate = cap.get(5)
-    total_frames = int(cap.get(7))
+# Parameters for motion estimation
+mbSize = 16
+p = 8
 
-    print(f"Video Resolution: {frame_width}x{frame_height}")
-    print(f"Frame Rate: {frame_rate} fps")
-    print(f"Total Frames: {total_frames}")
+# Initialize variables for average metrics
+average_mse = 0
+average_psnr = 0
+average_ssim = 0
 
-    # Initialize variables to store motion vectors
-    all_motion_vectors = []
-    all_computations = []
+# Loop through consecutive frames, compute metrics, and display reconstructed frames
+for i in range(num_frames_to_examine - 1):
+    ret, frame1 = cap.read()
+    ret, frame2 = cap.read()
 
-    # Read the first frame
-    ret, prev_frame = cap.read()
+    frame1_gray = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+    frame2_gray = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
 
-    # Convert the first frame to grayscale
-    prev_frame_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    motion_vectors = motion_estimation_exhaustive_search(frame1_gray, frame2_gray, mbSize, p)
+    reconstructed_frame = reconstruct_frame(frame1_gray, motion_vectors, mbSize)
 
-    # Iterate through the specified number of frames
-    for _ in range(min(num_frames, total_frames - 1)):
-        # Read the next frame
-        ret, curr_frame = cap.read()
+    metrics = compute_metrics(frame2_gray, reconstructed_frame)
+    average_mse += metrics[0]
+    average_psnr += metrics[1]
+    average_ssim += metrics[2]
 
-        # Convert the current frame to grayscale
-        curr_frame_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+    # Display the reconstructed frame with window title
+    window_title = f"Frame {i + 1} - Frame {i + 2}"
+    cv2.imshow(window_title, reconstructed_frame)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
-        # Calculate motion vectors using the exhaustive search method
-        motion_vectors, computations = motion_estimation_exhaustive_search(curr_frame_gray, prev_frame_gray, mbSize, p)
+# Calculate average metrics
+average_mse /= num_frames_to_examine - 1
+average_psnr /= num_frames_to_examine - 1
+average_ssim /= num_frames_to_examine - 1
 
-        # Store the motion vectors and computations
-        all_motion_vectors.append(motion_vectors)
-        all_computations.append(computations)
+# Display the average metrics
+print(f"Average MSE: {average_mse}")
+print(f"Average PSNR: {average_psnr} dB")
+print(f"Average SSIM: {average_ssim}")
 
-        # Set the current frame as the previous frame for the next iteration
-        prev_frame_gray = curr_frame_gray
-
-    # Release the video capture object
-    cap.release()
-
-    return all_motion_vectors, all_computations
-
-
-def print_motion_vectors(motion_vectors):
-    for i, vectors in enumerate(motion_vectors):
-        print(f"Frame {i + 1} - Motion Vectors:")
-        for j in range(vectors.shape[1]):
-            print(f"  Block {j + 1}: ({vectors[0, j]}, {vectors[1, j]})")
-        print()
-
-
-# Example usage
-video_path = 'Foreman360p.mp4'
-macroblock_size = 16
-search_parameter = 7
-n_frames = 10
-
-motion_vectors, computations = calculate_motion_vectors(video_path, macroblock_size, search_parameter, n_frames)
-print_motion_vectors(motion_vectors)
-print(computations)
-
-
+# Release the video capture object
+cap.release()
+cv2.destroyAllWindows()
